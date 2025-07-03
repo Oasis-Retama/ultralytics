@@ -167,7 +167,6 @@ class STrack(BaseTrack):
         """
         self.frame_id = frame_id
         self.tracklet_len += 1
-
         new_tlwh = new_track.tlwh
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, self.convert_coords(new_tlwh)
@@ -304,6 +303,7 @@ class BYTETracker:
 
         scores = results.conf
         bboxes = results.xywhr if hasattr(results, "xywhr") else results.xywh
+        bboxes = self.mult_bboxes(bboxes)
         # Add index
         bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
         cls = results.cls
@@ -409,8 +409,30 @@ class BYTETracker:
         self.removed_stracks.extend(removed_stracks)
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum
+        
+        output = [x.result for x in self.tracked_stracks if x.is_activated and x.tracklet_len > 2] # Roi added - start track only after x frames
+        output = self.dev_bboxes(output)
+        return np.asarray(output, dtype=np.float32)
 
-        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+    def mult_bboxes(self, boxes, factor=4):
+        for box in boxes:
+            box[2] *= factor
+            box[3] *= factor
+        return boxes
+
+    def dev_bboxes(self, boxes, factor=4):
+        for box in boxes:
+            w = box[2] - box[0]
+            h = box[3] - box[1]
+            x = box[0] + w/2
+            y = box[1] + h/2
+            w /= factor
+            h /= factor
+            box[0] = x - w/2
+            box[1] = y - h/2
+            box[2] = x + w/2
+            box[3] = y + h/2
+        return boxes
 
     def get_kalmanfilter(self) -> KalmanFilterXYAH:
         """Return a Kalman filter object for tracking bounding boxes using KalmanFilterXYAH."""
