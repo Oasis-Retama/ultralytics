@@ -1,15 +1,19 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+from __future__ import annotations
+
 import os
 import random
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import dataloader, distributed
 
+from ultralytics.cfg import IterableSimpleNamespace
 from ultralytics.data.dataset import GroundingDataset, YOLODataset, YOLOMultiModalDataset
 from ultralytics.data.loaders import (
     LOADERS,
@@ -21,9 +25,10 @@ from ultralytics.data.loaders import (
     SourceTypes,
     autocast_list,
 )
-from ultralytics.data.utils import IMG_FORMATS, PIN_MEMORY, VID_FORMATS
+from ultralytics.data.utils import IMG_FORMATS, VID_FORMATS
 from ultralytics.utils import RANK, colorstr
 from ultralytics.utils.checks import check_file
+from ultralytics.utils.torch_utils import TORCH_2_0
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
@@ -53,6 +58,8 @@ class InfiniteDataLoader(dataloader.DataLoader):
 
     def __init__(self, *args: Any, **kwargs: Any):
         """Initialize the InfiniteDataLoader with the same arguments as DataLoader."""
+        if not TORCH_2_0:
+            kwargs.pop("prefetch_factor", None)  # not supported by earlier versions
         super().__init__(*args, **kwargs)
         object.__setattr__(self, "batch_sampler", _RepeatSampler(self.batch_sampler))
         self.iterator = super().__iter__()
@@ -111,7 +118,16 @@ def seed_worker(worker_id: int):  # noqa
     random.seed(worker_seed)
 
 
-def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, stride=32, multi_modal=False):
+def build_yolo_dataset(
+    cfg: IterableSimpleNamespace,
+    img_path: str,
+    batch: int,
+    data: dict[str, Any],
+    mode: str = "train",
+    rect: bool = False,
+    stride: int = 32,
+    multi_modal: bool = False,
+):
     """Build and return a YOLO dataset based on configuration parameters."""
     dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
     return dataset(
@@ -123,7 +139,7 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, str
         rect=cfg.rect or rect,  # rectangular batches
         cache=cfg.cache or None,
         single_cls=cfg.single_cls or False,
-        stride=int(stride),
+        stride=stride,
         pad=0.0 if mode == "train" else 0.5,
         prefix=colorstr(f"{mode}: "),
         task=cfg.task,
@@ -133,11 +149,21 @@ def build_yolo_dataset(cfg, img_path, batch, data, mode="train", rect=False, str
     )
 
 
-def build_grounding(cfg, img_path, json_file, batch, mode="train", rect=False, stride=32):
+def build_grounding(
+    cfg: IterableSimpleNamespace,
+    img_path: str,
+    json_file: str,
+    batch: int,
+    mode: str = "train",
+    rect: bool = False,
+    stride: int = 32,
+    max_samples: int = 80,
+):
     """Build and return a GroundingDataset based on configuration parameters."""
     return GroundingDataset(
         img_path=img_path,
         json_file=json_file,
+        max_samples=max_samples,
         imgsz=cfg.imgsz,
         batch_size=batch,
         augment=mode == "train",  # augmentation
@@ -145,7 +171,7 @@ def build_grounding(cfg, img_path, json_file, batch, mode="train", rect=False, s
         rect=cfg.rect or rect,  # rectangular batches
         cache=cfg.cache or None,
         single_cls=cfg.single_cls or False,
-        stride=int(stride),
+        stride=stride,
         pad=0.0 if mode == "train" else 0.5,
         prefix=colorstr(f"{mode}: "),
         task=cfg.task,
@@ -186,11 +212,12 @@ def build_dataloader(dataset, batch: int, workers: int, shuffle: bool = True, ra
         shuffle=shuffle and sampler is None,
         num_workers=nw,
         sampler=sampler,
-        pin_memory=PIN_MEMORY,
+        prefetch_factor=4 if nw > 0 else None,  # increase over default 2
+        pin_memory=nd > 0,
         collate_fn=getattr(dataset, "collate_fn", None),
         worker_init_fn=seed_worker,
         generator=generator,
-        drop_last=drop_last,
+        drop_last=drop_last and len(dataset) % batch != 0,
     )
 
 

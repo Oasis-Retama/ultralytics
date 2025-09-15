@@ -6,7 +6,7 @@ from ultralytics.data import YOLOConcatDataset, build_grounding, build_yolo_data
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.world import WorldTrainer
 from ultralytics.utils import DATASETS_DIR, DEFAULT_CFG, LOGGER
-from ultralytics.utils.torch_utils import de_parallel
+from ultralytics.utils.torch_utils import unwrap_model
 
 
 class WorldTrainerFromScratch(WorldTrainer):
@@ -94,20 +94,28 @@ class WorldTrainerFromScratch(WorldTrainer):
         standard YOLO datasets and grounding datasets with different formats.
 
         Args:
-            img_path (List[str] | str): Path to the folder containing images or list of paths.
+            img_path (list[str] | str): Path to the folder containing images or list of paths.
             mode (str): 'train' mode or 'val' mode, allowing customized augmentations for each mode.
             batch (int, optional): Size of batches, used for rectangular training/validation.
 
         Returns:
             (YOLOConcatDataset | Dataset): The constructed dataset for training or validation.
         """
-        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
+        gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
         if mode != "train":
             return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=False, stride=gs)
         datasets = [
             build_yolo_dataset(self.args, im_path, batch, self.training_data[im_path], stride=gs, multi_modal=True)
             if isinstance(im_path, str)
-            else build_grounding(self.args, im_path["img_path"], im_path["json_file"], batch, stride=gs)
+            else build_grounding(
+                # assign `nc` from validation set to max number of text samples for training consistency
+                self.args,
+                im_path["img_path"],
+                im_path["json_file"],
+                batch,
+                stride=gs,
+                max_samples=self.data["nc"],
+            )
             for im_path in img_path
         ]
         self.set_text_embeddings(datasets, batch)  # cache text embeddings to accelerate training
