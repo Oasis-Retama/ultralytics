@@ -407,7 +407,7 @@ class BYTETracker:
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum
 
-        output = [x.result for x in self.tracked_stracks if x.is_activated and x.tracklet_len > 2] # Roi added - start track only after x frames
+        output = [x.result for x in self.tracked_stracks if x.is_activated and x.tracklet_len >= 0] # Roi added - start track only after x frames
         output = self.dev_bboxes(output)
         return np.asarray(output, dtype=np.float32)
 
