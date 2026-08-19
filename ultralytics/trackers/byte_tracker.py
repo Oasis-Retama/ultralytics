@@ -489,9 +489,32 @@ class BYTETracker:
                 track.mark_removed()
                 removed.append(track)
 
+    def mult_bboxes(self, boxes, factor=4):
+        """Inflate xywh detections before association: IoU matching loses tiny targets."""
+        for box in boxes:
+            box[2] *= factor
+            box[3] *= factor
+        return boxes
+
+    def dev_bboxes(self, boxes, factor=4):
+        """Undo mult_bboxes on xyxy output, keeping the centre, so callers get true-size boxes."""
+        for box in boxes:
+            w = box[2] - box[0]
+            h = box[3] - box[1]
+            x = box[0] + w / 2
+            y = box[1] + h / 2
+            w /= factor
+            h /= factor
+            box[0] = x - w / 2
+            box[1] = y - h / 2
+            box[2] = x + w / 2
+            box[3] = y + h / 2
+        return boxes
+
     def _format_output(self) -> np.ndarray:
         """Format the current tracked objects into the output array."""
-        return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+        output = [x.result for x in self.tracked_stracks if x.is_activated]
+        return np.asarray(self.dev_bboxes(output), dtype=np.float32)
 
     def get_kalmanfilter(self) -> KalmanFilterXYAH:
         """Return a Kalman filter object for tracking bounding boxes using KalmanFilterXYAH."""
@@ -502,6 +525,7 @@ class BYTETracker:
         if len(results) == 0:
             return []
         bboxes = parse_bboxes(results)
+        bboxes = self.mult_bboxes(bboxes)
         return [self.track_class(xywh, s, c) for (xywh, s, c) in zip(bboxes, results.conf, results.cls)]
 
     def get_dists(self, tracks: list[STrack], detections: list[STrack]) -> np.ndarray:
