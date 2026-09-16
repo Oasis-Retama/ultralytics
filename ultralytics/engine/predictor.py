@@ -167,6 +167,70 @@ class BasePredictor:
             (torch.Tensor): Preprocessed image tensor of shape (N, 3, H, W).
         """
         not_tensor = not isinstance(im, torch.Tensor)
+        # The GPU letterbox serves one case only: a single uint8 BGR frame into an accelerator whose input shape
+        # comes from export metadata. A fixed network shape rules out the auto/rect padding pre_transform can
+        # choose, and lets the staging and network buffers stay alive — and at a fixed address, which is what
+        # graph capture requires — between frames.
+        if (
+            not_tensor
+            and len(im) == 1
+            and self.device.type == "cuda"
+            and self.model.format != "pt"
+            and not getattr(self.model, "dynamic", False)
+            and im[0].dtype == np.uint8
+            and im[0].ndim == 3
+            and im[0].shape[2] == 3
+        ):
+            frame = im[0]
+            src_h, src_w = frame.shape[:2]
+            net_h, net_w = self.imgsz
+            r = min(net_h / src_h, net_w / src_w)
+            # Only the pad-only letterbox goes to the GPU. At scale 1.0 no interpolation happens, so the result is
+            # the same tensor the cv2 path builds; a frame that would resize keeps the CPU path below.
+            if (round(src_w * r), round(src_h * r)) == (src_w, src_h):
+                shape = (src_h, src_w, net_h, net_w)
+                state = getattr(self, "_gpu_letterbox", None)
+                assert state is None or state["shape"] == shape, (
+                    f"GPU letterbox is built for {state['shape']} and cannot serve {shape}"
+                )
+                if state is None:
+                    dtype = torch.half if self.model.fp16 else torch.float
+                    # Grey 114 everywhere, divided on the device the same way the CPU path divides it, so the pad
+                    # equals data/augment.py's cv2.copyMakeBorder value exactly. Only the interior is rewritten.
+                    net = torch.full((1, 3, net_h, net_w), 114.0, dtype=dtype, device=self.device).div_(255)
+                    top = round((net_h - src_h) / 2 - 0.1)
+                    left = round((net_w - src_w) / 2 - 0.1)
+                    state = {
+                        "shape": shape,
+                        "dtype": dtype,
+                        "pinned": torch.empty((src_h, src_w, 3), dtype=torch.uint8, pin_memory=True),
+                        "net": net,
+                        "interior": net[0, :, top : top + src_h, left : left + src_w],
+                        "graph": None,
+                    }
+                    self._gpu_letterbox = state
+
+                def _fill_network_input():
+                    device_frame = state["pinned"].to(self.device, non_blocking=True)
+                    state["interior"].copy_(device_frame.permute(2, 0, 1).flip(0).to(state["dtype"]).div_(255))
+
+                state["pinned"].copy_(torch.from_numpy(frame))
+                if state["graph"] is None:
+                    # Captured here, on the first frame that needs no resize, rather than at warmup: the warmup
+                    # frame is square and upscales, and a graph holding that resize would be replayed for every
+                    # production frame. Capture needs the work warmed on a side stream first.
+                    warmup = torch.cuda.Stream()
+                    warmup.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(warmup):
+                        for _ in range(3):
+                            _fill_network_input()
+                    torch.cuda.current_stream().wait_stream(warmup)
+                    state["graph"] = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(state["graph"]):
+                        _fill_network_input()
+                state["graph"].replay()
+                return state["net"]
+
         if not_tensor:
             im = np.stack(self.pre_transform(im))
             if im.shape[-1] == 3:
