@@ -141,11 +141,12 @@ class TensorRTBackend(BaseBackend):
 
         # A static engine dispatched from a captured graph. execute_v2 is synchronous, and a synchronous CUDA call
         # during capture fails, so the captured path has to enqueue asynchronously instead. The assert above is the
-        # dimension guard: a shape change fails there before any replay. An address change means a different input
-        # tensor, which the baked-in binding cannot serve, so it re-captures rather than replaying a stale graph.
+        # dimension guard: a shape change fails there before any replay. The graph is captured once, on the first
+        # input tensor, which is kept so its address stays valid. A later input at another address (a resized frame
+        # is a new tensor every call) is copied into it; re-capturing per frame would cost ~180 ms.
         if self.is_trt10 and not self.dynamic:
-            ptr = int(im.data_ptr())
-            if getattr(self, "graph_input", None) != ptr:
+            if getattr(self, "graph_input", None) is None:
+                ptr = int(im.data_ptr())
                 for name, binding in self.bindings.items():
                     self.context.set_tensor_address(name, ptr if name == "images" else binding.ptr)
                 warmup = torch.cuda.Stream()
@@ -157,7 +158,9 @@ class TensorRTBackend(BaseBackend):
                 self.graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(self.graph):
                     self.context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-                self.graph_input = ptr
+                self.graph_input = im
+            elif im.data_ptr() != self.graph_input.data_ptr():
+                self.graph_input.copy_(im)
             self.graph.replay()
         else:
             self.binding_addrs["images"] = int(im.data_ptr())
