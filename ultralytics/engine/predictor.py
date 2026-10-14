@@ -71,6 +71,21 @@ Example:
 """
 
 
+def _linear_taps(src: int, dst: int, clamp_weight: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Source indices and 11-bit weights of cv2.resize INTER_LINEAR on uint8, along one axis.
+
+    cv2 clamps a border column's weight to the edge pixel but only the index of a border row, so its row weight
+    still splits between two copies of the same row; the split is what its rounding sees.
+    """
+    f = ((np.arange(dst) + 0.5) * (src / dst) - 0.5).astype(np.float32)
+    i = np.floor(f).astype(np.int64)
+    f -= i
+    if clamp_weight:
+        f[(i < 0) | (i >= src - 1)] = 0
+    w0 = np.round((1 - f) * 2048).astype(np.int32)
+    return np.clip(i, 0, src - 1), np.clip(i + 1, 0, src - 1), w0, 2048 - w0
+
+
 class BasePredictor:
     """A base class for creating predictors.
 
@@ -185,51 +200,62 @@ class BasePredictor:
             src_h, src_w = frame.shape[:2]
             net_h, net_w = self.imgsz
             r = min(net_h / src_h, net_w / src_w)
-            # Only the pad-only letterbox goes to the GPU. At scale 1.0 no interpolation happens, so the result is
-            # the same tensor the cv2 path builds; a frame that would resize keeps the CPU path below.
-            if (round(src_w * r), round(src_h * r)) == (src_w, src_h):
-                shape = (src_h, src_w, net_h, net_w)
-                state = getattr(self, "_gpu_letterbox", None)
-                assert state is None or state["shape"] == shape, (
-                    f"GPU letterbox is built for {state['shape']} and cannot serve {shape}"
-                )
-                if state is None:
-                    dtype = torch.half if self.model.fp16 else torch.float
-                    # Grey 114 everywhere, divided on the device the same way the CPU path divides it, so the pad
-                    # equals data/augment.py's cv2.copyMakeBorder value exactly. Only the interior is rewritten.
-                    net = torch.full((1, 3, net_h, net_w), 114.0, dtype=dtype, device=self.device).div_(255)
-                    top = round((net_h - src_h) / 2 - 0.1)
-                    left = round((net_w - src_w) / 2 - 0.1)
-                    state = {
-                        "shape": shape,
-                        "dtype": dtype,
-                        "pinned": torch.empty((src_h, src_w, 3), dtype=torch.uint8, pin_memory=True),
-                        "net": net,
-                        "interior": net[0, :, top : top + src_h, left : left + src_w],
-                        "graph": None,
-                    }
-                    self._gpu_letterbox = state
+            # The same size, rounding and pad split as data/augment.py's LetterBox. A pad-only frame (scale 1.0) is
+            # copied as is; a resized frame is interpolated with cv2.resize INTER_LINEAR's integer arithmetic, so
+            # both equal the cv2 path exactly.
+            new_w, new_h = round(src_w * r), round(src_h * r)
+            shape = (src_h, src_w, net_h, net_w)
+            # One state per input shape: the warmup frame (square) and the camera frame each keep their own
+            # buffers and graph, so neither is rebuilt or replayed for the other.
+            states = self.__dict__.setdefault("_gpu_letterbox", {})
+            state = states.get(shape)
+            if state is None:
+                dtype = torch.half if self.model.fp16 else torch.float
+                # Grey 114 everywhere, divided on the device the same way the CPU path divides it, so the pad
+                # equals data/augment.py's cv2.copyMakeBorder value exactly. Only the interior is rewritten.
+                net = torch.full((1, 3, net_h, net_w), 114.0, dtype=dtype, device=self.device).div_(255)
+                top = round((net_h - new_h) / 2 - 0.1)
+                left = round((net_w - new_w) / 2 - 0.1)
+                state = {
+                    "dtype": dtype,
+                    "taps": None,
+                    "pinned": torch.empty((src_h, src_w, 3), dtype=torch.uint8, pin_memory=True),
+                    "net": net,
+                    "interior": net[0, :, top : top + new_h, left : left + new_w],
+                    "graph": None,
+                }
+                if (new_w, new_h) != (src_w, src_h):
+                    x0, x1, wx0, wx1 = _linear_taps(src_w, new_w, clamp_weight=True)
+                    y0, y1, wy0, wy1 = _linear_taps(src_h, new_h, clamp_weight=False)
+                    state["taps"] = tuple(
+                        torch.from_numpy(a).to(self.device) for a in (x0, x1, wx0, wx1, y0, y1, wy0[:, None], wy1[:, None])
+                    )
+                states[shape] = state
 
-                def _fill_network_input():
-                    device_frame = state["pinned"].to(self.device, non_blocking=True)
-                    state["interior"].copy_(device_frame.permute(2, 0, 1).flip(0).to(state["dtype"]).div_(255))
+            def _fill_network_input():
+                device_frame = state["pinned"].to(self.device, non_blocking=True).permute(2, 0, 1).flip(0)
+                if state["taps"] is not None:
+                    # cv2's integer bilinear, as its NEON/SSE path computes it: 11-bit weights, rows first.
+                    x0, x1, wx0, wx1, y0, y1, wy0, wy1 = state["taps"]
+                    s = device_frame.int()
+                    h = (s.index_select(2, x0) * wx0 + s.index_select(2, x1) * wx1) >> 4
+                    device_frame = (((h.index_select(1, y0) * wy0) >> 16) + ((h.index_select(1, y1) * wy1) >> 16) + 2) >> 2
+                state["interior"].copy_(device_frame.to(state["dtype"]).div_(255))
 
-                state["pinned"].copy_(torch.from_numpy(frame))
-                if state["graph"] is None:
-                    # Captured here, on the first frame that needs no resize, rather than at warmup: the warmup
-                    # frame is square and upscales, and a graph holding that resize would be replayed for every
-                    # production frame. Capture needs the work warmed on a side stream first.
-                    warmup = torch.cuda.Stream()
-                    warmup.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(warmup):
-                        for _ in range(3):
-                            _fill_network_input()
-                    torch.cuda.current_stream().wait_stream(warmup)
-                    state["graph"] = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(state["graph"]):
+            state["pinned"].copy_(torch.from_numpy(frame))
+            if state["graph"] is None:
+                # Capture needs the work warmed on a side stream first.
+                warmup = torch.cuda.Stream()
+                warmup.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(warmup):
+                    for _ in range(3):
                         _fill_network_input()
-                state["graph"].replay()
-                return state["net"]
+                torch.cuda.current_stream().wait_stream(warmup)
+                state["graph"] = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(state["graph"]):
+                    _fill_network_input()
+            state["graph"].replay()
+            return state["net"]
 
         if not_tensor:
             im = np.stack(self.pre_transform(im))
